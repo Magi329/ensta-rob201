@@ -27,6 +27,10 @@ class TinySlam:
         # Origin of the odom frame in the map frame
         self.odom_pose_ref = np.array([0, 0, 0])
 
+        self.path = False
+        
+
+
     def _conv_world_to_map(self, x_world, y_world):
         """
         Convert from world coordinates to map coordinates (i.e. cell index in the grid map)
@@ -65,17 +69,13 @@ class TinySlam:
         x_1, y_1 : end point coordinates in m
         val : value to add to each cell of the line
         """
-
         # convert to pixels
         x_start, y_start = self._conv_world_to_map(x_0, y_0)
         x_end, y_end = self._conv_world_to_map(x_1, y_1)
-
         if x_start < 0 or x_start >= self.x_max_map or y_start < 0 or y_start >= self.y_max_map:
             return
-
         if x_end < 0 or x_end >= self.x_max_map or y_end < 0 or y_end >= self.y_max_map:
             return
-
         # Bresenham line drawing
         dx = x_end - x_start
         dy = y_end - y_start
@@ -104,7 +104,7 @@ class TinySlam:
         points = np.array(points).T
 
         # add value to the points
-        self.occupancy_map[points[0], points[1]] += val
+        self.occupancy_map[points[0], points[1]] += val  
 
     def add_map_points(self, points_x, points_y, val):
         """
@@ -129,9 +129,22 @@ class TinySlam:
         pose : [x, y, theta] nparray, position of the robot to evaluate, in world coordinates
         """
         # TODO for TP4
-
-        score = 0
-
+        laser_dist = lidar.get_sensor_values()
+        laser_angle = lidar.get_ray_angles()
+        reserve = laser_dist < lidar.max_range #laser_dist.max()
+        laser_dist = laser_dist[reserve]
+        laser_angle = laser_angle[reserve]
+        # Estimer les positions des d´etections du laser dans le repère global
+        laser_x_world = pose[0] + laser_dist*np.cos(pose[2]+laser_angle)
+        laser_y_world = pose[1] + laser_dist*np.sin(pose[2]+laser_angle)
+        # Convertir ces positions dans le repère de la carte
+        laser_x_map, laser_y_map = self._conv_world_to_map(laser_x_world, laser_y_world)
+        # supprimer les points hors de la carte
+        laser_x_map = [x for x in laser_x_map if x<= self.occupancy_map.shape[0] and x>=0]
+        laser_y_map = [y for y in laser_y_map if y<= self.occupancy_map.shape[1] and y>=0]
+        # Lire et additionner les valeurs
+        score = np.sum(np.exp(self.occupancy_map[laser_x_map, laser_y_map]))
+        
         return score
 
     def get_corrected_pose(self, odom, odom_pose_ref=None):
@@ -143,8 +156,15 @@ class TinySlam:
                         use self.odom_pose_ref if not given
         """
         # TODO for TP4
-        corrected_pose = odom_pose
 
+        if odom_pose_ref is None:
+            odom_pose_ref = self.odom_pose_ref
+            # changement de repère par une transformation matricielle
+            # corrected_pose[:2] = odom[:2]*[[np.cos(theta), np.sin(theta)],[ -np.sin(theta),  np.cos(theta)]] + self.odom_pose_ref[:2]
+            # corrected_pose[2] = odom[2] + self.odom_pose_ref[2]
+            # theta = odom_pose_ref[2]
+        corrected_pose = odom + odom_pose_ref
+ 
         return corrected_pose
 
     def localise(self, lidar, odom):
@@ -154,19 +174,75 @@ class TinySlam:
         odom : [x, y, theta] nparray, raw odometry position
         """
         # TODO for TP4
+        # Calculez le score du scan laser avec la position de r´ef´erence actuelle de l’odom´etrie
+        best_score = self.score(lidar, self.get_corrected_pose(odom))
+        odom_pose_ref = self.odom_pose_ref
+        sigma = [0.7, 0.6, 0.02]                            
+        # Tirez 10 fois
+        for i in range(100): 
+            # Tirez un offset aléatoire
+            offset = np.random.normal(odom_pose_ref, sigma)
+            # ajoutez le à la position de référence de l’odométrie
+            pose_world = self.get_corrected_pose(odom, offset)
+            # Calculez le score du scan laser avec cette nouvelle position de r´ef´erence de l’odom´etrie
+            score_tmp = self.score(lidar, pose_world)
+            # Si le score est meilleur, m´emorisez ce score et la nouvelle position de r´ef´erence
+            if score_tmp > best_score:
+                best_score = score_tmp
+                odom_pose_ref = offset
+        #print("vecteur de correction: ", odom_pose_ref)
+        #print("score: ", best_score)
+        if best_score > 20000:
+            self.odom_pose_ref = odom_pose_ref
 
-        best_score = 0
-
-        return best_score
-
+   
     def update_map(self, lidar, pose):
         """
         Bayesian map update with new observation
         lidar : placebot object with lidar data
         pose : [x, y, theta] nparray, corrected pose in world coordinates
         """
-        # TODO for TP3
+         
+        # convert polar coordinates of laser scan to absolute position
+        laser_dist = lidar.get_sensor_values()
+        laser_angle = lidar.get_ray_angles() 
+        laser_coor_x = pose[0] + laser_dist*np.cos(pose[2] + laser_angle)
+        laser_coor_y = pose[1] + laser_dist*np.sin(pose[2] + laser_angle)
+        
+        # mise à jour des points sur la ligne entre robot et points détectés avec une probabilité faible
+        # mise à jour des points détectés avec une probabilité forte
+        # mettre une zone pour verrouiller les erreurs
+        for i in range(360):
+            self.add_map_line(pose[0], pose[1], laser_coor_x[i], laser_coor_y[i], -2)
+            self.add_map_line(pose[0]+(laser_coor_x[i]-pose[0])*0.95, pose[1]+(laser_coor_y[i]-pose[1])*0.95, laser_coor_x[i], laser_coor_y[i], 2)
+        self.add_map_points(laser_coor_x, laser_coor_y,4)
 
+        # seuillage
+        seuil = 6
+        self.occupancy_map[self.occupancy_map > seuil] = seuil
+        self.occupancy_map[self.occupancy_map < -seuil] = -seuil
+
+    def get_neighbors(self, current):
+        """
+        Trouver les voisins 
+        current: coordonnées x y de la position du robot
+        """
+        x = current[0]
+        y = current[1]
+        neighbors = [[x-1, y+1], [x, y+1], [x+1, y+1], 
+                     [x-1, y], [x+1, y], 
+                     [x-1, y-1], [x, y-1], [x+1, y-1]]
+        return neighbors
+    
+    def reconstruct_path(self,cameFrom, current):
+        """build the road from start to goal when A star has finished the plan"""
+        total_path = [current]
+        index = current[0]*self.occupancy_map.shape[0] + current[1]
+        while index in cameFrom.keys():
+            current = cameFrom[index]
+            total_path.insert(0,current)
+            index = current[0]*self.occupancy_map.shape[0] + current[1]
+        return total_path
 
     def plan(self, start, goal):
         """
@@ -176,8 +252,44 @@ class TinySlam:
         """
         # TODO for TP5
 
-        path = [start, goal]  # list of poses
-        return path
+        # initialization
+        openSet = [start]
+        closeSet = []
+        cameFrom = {}
+        g = np.full_like(self.occupancy_map, np.inf)
+        g[start] = 0
+        f = np.full_like(self.occupancy_map, np.inf)
+        f[start] = np.sqrt((goal[0]-start[0])**2 + (goal[1]-start[1])**2)
+
+        while openSet:
+            openSet_arr = np.array(openSet)
+            f_tmp = f[openSet_arr[:,0], openSet_arr[:,1]]
+            ind_cur = np.argmin(f_tmp)
+            current = openSet[ind_cur]
+            self.occupancy_map[current[0], current[1]] = 1.8
+            self.display2(self.odom_pose_ref)
+            # if found the path return
+            if current[0] == goal[0] and current[1] == goal[1]:
+                total_path = self.reconstruct_path(cameFrom, current)
+                self.path = np.array(total_path)
+                return total_path
+            openSet.remove(current)
+            closeSet.append(current)
+
+            neighbours = self.get_neighbors(current)
+            for neighbour in neighbours:
+                if neighbour in closeSet or self.occupancy_map[neighbour[0], neighbour[1]] > 1:
+                    continue
+                tentative_g = g[current[0], current[1]] + np.sqrt((neighbour[0]-current[0])**2 + (neighbour[1]-current[1])**2)
+                if tentative_g < g[neighbour[0], neighbour[1]]:
+                    cameFrom[neighbour[0]*self.occupancy_map.shape[0] + neighbour[1]] = current
+                    g[neighbour[0], neighbour[1]] = tentative_g
+                    f[neighbour[0], neighbour[1]] = tentative_g + np.sqrt((goal[0]-neighbour[0])**2 + (goal[1]-neighbour[1])**2)
+                    if neighbour not in openSet:
+                        openSet.append(neighbour)
+        return False
+
+
 
     def display(self, robot_pose):
         """
@@ -254,16 +366,4 @@ class TinySlam:
         """
         # TODO
 
-    def compute(self):
-        """ Useless function, just for the exercise on using the profiler """
-        # Remove after TP1
 
-        ranges = np.random.rand(3600)
-        ray_angles = np.arange(-np.pi,np.pi,np.pi/1800)
-
-        # Poor implementation of polar to cartesian conversion
-        points = []
-        for i in range(3600):
-            pt_x = ranges[i] * np.cos(ray_angles[i])
-            pt_y = ranges[i] * np.sin(ray_angles[i])
-            points.append([pt_x,pt_y])
